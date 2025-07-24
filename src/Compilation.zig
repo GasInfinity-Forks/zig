@@ -4212,7 +4212,7 @@ pub fn getAllErrorsAlloc(comp: *Compilation) error{OutOfMemory}!ErrorBundle {
             std.mem.sort(Zcu.ErrorMsg, messages.items, @as(SortContext, .{ .read_err = &read_err, .zcu = zcu }), SortContext.lessThan);
             if (read_err) |e| {
                 try unableToLoadZcuFile(zcu, &bundle, e.file, e.err);
-                break :compile_log_text "";
+                break :compile_log_text;
             }
         }
 

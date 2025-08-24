@@ -23297,31 +23297,16 @@ fn checkAtomicPtrOperand(
         return sema.failWithOwnedErrorMsg(block, msg);
     };
 
-    feature_condition.prohibited.intersectFeatureSet(target.cpu.features);
-    feature_condition.required.removeFeatureSet(target.cpu.features);
-    if (!feature_condition.prohibited.isEmpty()) {
+    if(!feature_condition.check(target.cpu.features)) {
         return sema.fail(
             block,
             atomic_op_src,
-            "{d}-byte {f} on {s} cannot be used with the following CPU features: {f}",
+            "{d}-byte {f} on {s} cannot be used, the CPU doesn't satisfy: {f}",
             .{
                 elem_size,
                 atomic_op,
                 @tagName(target.cpu.arch),
-                feature_condition.prohibited.fmtList(target.cpu.arch.family(), "or"),
-            },
-        );
-    }
-    if (!feature_condition.required.isEmpty()) {
-        return sema.fail(
-            block,
-            atomic_op_src,
-            "{d}-byte {f} on {s} requires the following missing CPU features: {f}",
-            .{
-                elem_size,
-                atomic_op,
-                @tagName(target.cpu.arch),
-                feature_condition.required.fmtList(target.cpu.arch.family(), "and"),
+                feature_condition.fmt(target.cpu.arch.family()),
             },
         );
     }

@@ -1268,19 +1268,13 @@ pub const Cpu = struct {
                     const bit_set: BitSet = .{ .masks = fmt.set.ints };
                     var it = bit_set.iterator(.{});
                     var next = it.next();
+
                     if (next == null) {
                         return writer.writeAll("<none>");
                     }
-                    var i: usize = 0;
-                    while (next) |feat| : (i += 1) {
-                        next = it.next();
 
-                        if (i > 1 or (i > 0 and next != null)) {
-                            try writer.writeAll(", ");
-                        }
-                        if (next == null) {
-                            try writer.print("{s} ", .{fmt.conjunction});
-                        }
+                    while (next) |feat| {
+                        next = it.next();
 
                         const name = switch (fmt.family) {
                             inline else => |family| blk: {
@@ -1292,6 +1286,10 @@ pub const Cpu = struct {
                             },
                         };
                         try writer.writeAll(name);
+
+                        if (next != null) {
+                            try writer.print(" {s} ", .{fmt.conjunction});
+                        }
                     }
                 }
             };

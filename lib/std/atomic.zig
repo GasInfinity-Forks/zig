@@ -491,6 +491,7 @@ pub const Op = union(enum) {
     pub fn supported(op: Op, comptime T: type) bool {
         return op.supportedOnCpu(T, builtin.cpu);
     }
+
     /// Check if the operation is supported on the given type, on a specified CPU.
     pub fn supportedOnCpu(op: Op, comptime T: type, cpu: std.Target.Cpu) bool {
         const valid_types = op.supportedTypes();
@@ -580,7 +581,7 @@ pub const Op = union(enum) {
             },
 
             .sparc => {
-                const cas: Sizes = .upTo(4, .init(.sparc, .{ .require = &.{.hasleoncasa} }));
+                const cas: Sizes = .upTo(4, .all(.sparc, &.{.hasleoncasa}));
                 switch (op) {
                     .cmpxchg => return cas,
                     .load, .store => return .upTo(4, .always),
@@ -592,7 +593,7 @@ pub const Op = union(enum) {
             },
 
             .sparc64 => {
-                const cas: Sizes = .upTo(8, .init(.sparc, .{ .require = &.{.hasleoncasa} }));
+                const cas: Sizes = .upTo(8, .all(.sparc, &.{.hasleoncasa}));
                 switch (op) {
                     .cmpxchg => return cas,
                     .load, .store => return .upTo(8, .always),
@@ -603,14 +604,54 @@ pub const Op = union(enum) {
                 }
             },
 
-            .arm, .armeb, .thumb, .thumbeb => if (op == .cmpxchg) {
-                // The ARM v6m ISA has no ldrex/strex and so it's impossible to do CAS
-                // operations (unless we're targeting Linux, the kernel provides a way to
-                // perform CAS operations).
-                // XXX: The Linux code path is not implemented yet.
-                return .upTo(4, .init(.arm, .{ .prohibit = &.{.has_v6m} }));
-            } else {
-                return .upTo(4, .always);
+            .arm, .armeb, .thumb, .thumbeb => {
+                // Sources:
+                // https://developer.arm.com/documentation/dui0489/i/arm-and-thumb-instructions/ldrex
+                // https://developer.arm.com/documentation/ddi0406/c/Application-Level-Architecture/Instruction-Details/Alphabetical-list-of-instructions/SWP--SWPB
+                // https://developer.arm.com/documentation/ddi0419/c/Application-Level-Architecture/ARM-Architecture-Memory-Model/Memory-types-and-attributes-and-the-memory-order-model/Atomicity-in-the-ARM-architecture
+
+                // NOTE: comptime is needed here to store these conditions in rodata!
+                const supports_swp: FeatureCondition = comptime .all(.arm, &.{.v2a});
+                const supports_small_rex: FeatureCondition = comptime .@"or"(&.{ .all(.arm, &.{.mclass, .has_v7}), .all(.arm, &.{.mclass, .has_v8m}), .notAll(.arm, &.{.mclass, .has_v6k}) });
+                const supports_rex: FeatureCondition = comptime .@"or"(&.{ supports_small_rex, .@"and"(&.{ .notAll(.arm, &.{.mclass}), .all(.arm, &.{.has_v6}) }) });
+                const supports_rexd: FeatureCondition = comptime .@"and"(&.{ .notAny(.arm, &.{.mclass}), .all(.arm, &.{.has_v6k}) });
+
+                const rex_sizes = blk: {
+                    var sizes: Sizes = .none;
+                    sizes.put(1, supports_small_rex);
+                    sizes.put(2, supports_small_rex);
+                    sizes.put(4, supports_rex);
+                    sizes.put(8, supports_rexd);
+                    break :blk sizes;
+                };
+
+                switch (op) {
+                    // aligned loads and stores up to 32-bits become single-copy atomic in v6 / v6m. Before only words were atomic.
+                    // ldrex / strex introduced in v6
+                    // ldrex(b/h/d) / strex(b/h/d) introduced in v6k except ldrexd/strexd in m-class cpus.
+                    .load, .store, => {
+                        var sizes: Sizes = .none;
+                        sizes.put(1, .all(.arm, &.{.has_v6}));
+                        sizes.put(2, .all(.arm, &.{.has_v6}));
+                        sizes.put(4, .always); // TODO: audit this
+                        return sizes;
+                    },
+                    .cmpxchg => return rex_sizes,
+                    // ldrex / strex introduced in v6
+                    // ldrex(b/h/d) / strex(b/h/d) instroduced in v6k
+                    .rmw => |rmw_op| switch (rmw_op) {
+                        // swp(b) introduced in v2a, deprecated in v6
+                        .Xchg => {
+                            var sizes: Sizes = .none;
+                            sizes.put(1, comptime .@"or"(&.{supports_swp, supports_small_rex}));
+                            sizes.put(2, supports_small_rex);
+                            sizes.put(4, comptime .@"or"(&.{supports_swp, supports_rex}));
+                            sizes.put(8, supports_rexd);
+                            return sizes;
+                        },
+                        else => return rex_sizes,
+                    },
+                }
             },
 
             .aarch64,
@@ -635,13 +676,13 @@ pub const Op = union(enum) {
                     => return .none, // Not supported on wasm
                 };
 
-                return .upTo(8, .init(.wasm, .{ .require = &.{.atomics} }));
+                return .upTo(8, .all(.wasm, &.{.atomics}));
             },
 
             .x86 => {
                 var sizes: Sizes = .upTo(4, .always);
                 if (op == .cmpxchg) {
-                    sizes.put(8, .init(.x86, .{ .require = &.{.cx8} }));
+                    sizes.put(8, .all(.x86, &.{.cx8}));
                 }
                 return sizes;
             },
@@ -649,7 +690,7 @@ pub const Op = union(enum) {
             .x86_64 => {
                 var sizes: Sizes = .upTo(8, .always);
                 if (op == .cmpxchg) {
-                    sizes.put(16, .init(.x86, .{ .require = &.{.cx16} }));
+                    sizes.put(16, .all(.x86, &.{.cx16}));
                 }
                 return sizes;
             },
@@ -734,6 +775,7 @@ pub const Op = union(enum) {
             .supported = 0,
             .feature_conditions = undefined,
         };
+
         fn upTo(max: BitsetInt, condition: FeatureCondition) Sizes {
             std.debug.assert(std.math.isPowerOfTwo(max));
             var sizes: Sizes = .{
@@ -747,33 +789,104 @@ pub const Op = union(enum) {
 
             return sizes;
         }
+
         fn put(sizes: *Sizes, size: BitsetInt, condition: FeatureCondition) void {
             sizes.supported |= size;
             sizes.feature_conditions[std.math.log2_int(u64, size)] = condition;
         }
     };
 
-    pub const FeatureCondition = struct {
-        required: Set,
-        prohibited: Set,
+    pub const FeatureCondition = union(enum) {
+        always,
+        intersects: Set,
+        superset: Set,
+        not_intersects: Set,
+        not_superset: Set,
+        any_condition: []const FeatureCondition,
+        all_conditions: []const FeatureCondition,
+
         const Set = std.Target.Cpu.Feature.Set;
 
-        pub const always: FeatureCondition = .{ .required = .empty, .prohibited = .empty };
+        pub const Formatter = struct {
+            condition: FeatureCondition,
+            family: std.Target.Cpu.Arch.Family,
+
+            pub fn format(formatter: Formatter, writer: *std.Io.Writer) !void {
+                switch (formatter.condition) {
+                    .always => try writer.writeAll("true"),
+                    .intersects => |set| try writer.print("{f}", .{set.fmtList(formatter.family, "or")}),
+                    .superset => |set| try writer.print("{f}", .{set.fmtList(formatter.family, "and")}),
+                    .not_intersects => |set| try writer.print("not ({f})", .{set.fmtList(formatter.family, "or")}),
+                    .not_superset => |set| try writer.print("not ({f})", .{set.fmtList(formatter.family, "and")}),
+                    .any_condition, .all_conditions => |conditions| {
+                        const conjunction = switch(std.meta.activeTag(formatter.condition)) {
+                            .any_condition => " or ",
+                            .all_conditions => " and ",
+                            else => unreachable,
+                        };
+
+                        for (conditions, 0..) |condition, i| {
+                            try writer.print("({f})", .{condition.fmt(formatter.family)});
+
+                            if(i != conditions.len - 1) {
+                                try writer.writeAll(conjunction);
+                            }
+                        }
+                    }
+                }
+            }
+        };
 
         pub fn check(self: FeatureCondition, features: Set) bool {
-            return features.isSuperSetOf(self.required) and !features.intersectsWith(self.prohibited);
+            return switch (self) {
+                .always => true,
+                .intersects => |set| features.intersectsWith(set),
+                .superset => |set| features.isSuperSetOf(set),
+                .not_intersects => |set| !features.intersectsWith(set),
+                .not_superset => |set| !features.isSuperSetOf(set),
+                .any_condition => |conditions| or_cond: for(conditions) |condition| {
+                    if(condition.check(features)) {
+                        break :or_cond true;
+                    }
+                } else false,
+                .all_conditions => |conditions| and_cond: for (conditions) |condition| {
+                    if(!condition.check(features)) {
+                        break :and_cond false;
+                    }
+                } else true,
+            };
         }
 
-        fn init(comptime family: std.Target.Cpu.Arch.Family, opts: struct {
-            const Feature = @field(std.Target, @tagName(family)).Feature;
-            require: []const Feature = &.{},
-            prohibit: []const Feature = &.{},
-        }) FeatureCondition {
+        pub fn fmt(condition: FeatureCondition, family: std.Target.Cpu.Arch.Family) Formatter {
+            return .{ .condition = condition, .family = family }; 
+        }
+
+        fn any(comptime family: std.Target.Cpu.Arch.Family, values: []const @field(std.Target, @tagName(family)).Feature) FeatureCondition {
             const ns = @field(std.Target, @tagName(family));
-            return .{
-                .required = ns.featureSet(opts.require),
-                .prohibited = ns.featureSet(opts.prohibit),
-            };
+            return .{ .intersects = ns.featureSet(values) };
+        }
+
+        fn all(comptime family: std.Target.Cpu.Arch.Family, values: []const @field(std.Target, @tagName(family)).Feature) FeatureCondition {
+            const ns = @field(std.Target, @tagName(family));
+            return .{ .superset = ns.featureSet(values) };
+        }
+
+        fn notAny(comptime family: std.Target.Cpu.Arch.Family, values: []const @field(std.Target, @tagName(family)).Feature) FeatureCondition {
+            const ns = @field(std.Target, @tagName(family));
+            return .{ .not_intersects = ns.featureSet(values) };
+        }
+
+        fn notAll(comptime family: std.Target.Cpu.Arch.Family, values: []const @field(std.Target, @tagName(family)).Feature) FeatureCondition {
+            const ns = @field(std.Target, @tagName(family));
+            return .{ .not_superset = ns.featureSet(values) };
+        }
+
+        fn @"or"(values: []const FeatureCondition) FeatureCondition {
+            return .{ .any_condition = values };
+        }
+
+        fn @"and"(values: []const FeatureCondition) FeatureCondition {
+            return .{ .all_conditions = values };
         }
     };
 
@@ -923,6 +1036,42 @@ pub const Op = union(enum) {
         try std.testing.expect(sizes.get(16) != null);
         try std.testing.expect(sizes.get(16).?.check(x86.featureSet(&.{.cx16})));
         try std.testing.expect(!sizes.get(16).?.check(.empty));
+    }
+
+    test "arm baseline supports all ops up to 64-bit" {
+        const arm = std.Target.arm;
+        const baseline = arm.cpu.baseline.toCpu(.arm);
+        try std.testing.expect(supportedOnCpu(.{ .rmw = .Xchg }, u8, baseline));
+        try std.testing.expect(supportedOnCpu(.{ .rmw = .Xchg }, u16, baseline));
+        try std.testing.expect(supportedOnCpu(.{ .rmw = .Xchg }, u32, baseline));
+        try std.testing.expect(supportedOnCpu(.{ .rmw = .Xchg }, u64, baseline));
+
+        const sizes = supportedSizes(.{ .rmw = .Xchg }, .arm);
+        try std.testing.expect(sizes.get(4) != null);
+        try std.testing.expect(sizes.get(4).?.check(arm.featureSet(&.{.has_v6})));
+        try std.testing.expect(!sizes.get(4).?.check(.empty));
+    }
+
+    test "arm supports 32-bit Xchg RWM op with v6 and without mclass feature" {
+        const arm = std.Target.arm;
+        const arm1136j_s = arm.cpu.arm1136j_s.toCpu(.arm);
+        try std.testing.expect(supportedOnCpu(.{ .rmw = .Xchg }, u32, arm1136j_s));
+
+        const sizes = supportedSizes(.{ .rmw = .Xchg }, .arm);
+        try std.testing.expect(sizes.get(4) != null);
+        try std.testing.expect(sizes.get(4).?.check(arm.featureSet(&.{.has_v6})));
+        try std.testing.expect(!sizes.get(4).?.check(.empty));
+    }
+
+    test "arm supports 64-bit Xchg RWM op with v6k and without mclass features" {
+        const arm = std.Target.arm;
+        const mpcore = arm.cpu.mpcore.toCpu(.arm);
+        try std.testing.expect(supportedOnCpu(.{ .rmw = .Xchg }, u64, mpcore));
+
+        const sizes = supportedSizes(.{ .rmw = .Xchg }, .arm);
+        try std.testing.expect(sizes.get(8) != null);
+        try std.testing.expect(sizes.get(8).?.check(arm.featureSet(&.{.has_v6k})));
+        try std.testing.expect(!sizes.get(8).?.check(.empty));
     }
 };
 
